@@ -534,11 +534,23 @@ def main() -> None:
         n_raw_tok = count_tokens(raw, args.ollama_url, args.llm_model)
         ctx2 = _auto_num_ctx(n_raw_tok, CLEANUP_CTX)
         print(format_budget("phase 2 input (raw transcript)", n_raw_tok, ctx2, tok_src))
-        if n_raw_tok > MAX_CTX // 2:
+        if n_raw_tok > MAX_CTX:
             sys.exit(
-                f"\nInput is {n_raw_tok} tokens, exceeding the {MAX_CTX} hard cap.\n"
-                f"Split the audio into shorter chunks (e.g. with --skip-summary and a\n"
-                f"manual break) or use a model with a larger context window."
+                f"\nRaw transcript is {n_raw_tok} tokens, exceeding the "
+                f"{MAX_CTX} context cap. Phase 2 (cleanup) cannot run on "
+                f"inputs this large. Re-run with a smaller audio file or "
+                f"split the input manually."
+            )
+        if n_raw_tok > CLEANUP_CTX // 2:
+            # Cleanup is single-shot (not chunked). With raw inputs above
+            # ~CLEANUP_CTX/2 the model has limited headroom for the cleaned
+            # output, so quality may degrade (truncation or repetition).
+            # Surface this so the user knows to expect imperfect output.
+            print(
+                f"        WARNING: raw transcript is {n_raw_tok} tokens. "
+                f"Cleanup is single-shot at num_ctx={MAX_CTX}; cleaned "
+                f"output may be truncated. Consider splitting the audio "
+                f"for higher quality."
             )
         cleaned = clean_with_llm(raw, args.llm_model, client,
                                  input_tokens=n_raw_tok, debug=args.debug)
@@ -550,14 +562,17 @@ def main() -> None:
         # phase 3 only: still detect whether the tokenizer is exact or approximate
         tok_src = token_count_source(args.ollama_url, args.llm_model)
 
-    # phase 3
+    # phase 3 — chunked path is dispatched inside summarize_chunked_with_llm
+    # when the cleaned transcript is too large for a single 32k-context call.
     n_clean_tok = count_tokens(cleaned, args.ollama_url, args.llm_model)
     ctx3 = _auto_num_ctx(n_clean_tok, SUMMARY_CTX)
     print(format_budget("phase 3 input (cleaned transcript)", n_clean_tok, ctx3, tok_src))
-    if n_clean_tok > MAX_CTX // 2:
+    if n_clean_tok > MAX_CTX:
         sys.exit(
-            f"\nCleaned transcript is {n_clean_tok} tokens, exceeding the {MAX_CTX} hard cap.\n"
-            f"Try running with --skip-cleanup=False on smaller audio chunks."
+            f"\nCleaned transcript is {n_clean_tok} tokens, exceeding the "
+            f"{MAX_CTX} context cap. The chunker could not split this into "
+            f"sub-{MAX_CTX} pieces (likely a single very long sentence). "
+            f"Re-run with a smaller audio file."
         )
     summary = summarize_with_llm(cleaned, args.llm_model, client,
                                  session_meta=session_meta,
