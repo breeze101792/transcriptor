@@ -1,0 +1,10 @@
+# local outputs (per-run transcript folders)
+output/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# uv
+.venv/
