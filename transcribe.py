@@ -97,10 +97,94 @@ Transcript:
 {text}
 """
 
+# Phase 3 (summary) chunked-path prompts. CHUNK_SUMMARY_PROMPT is fed each
+# sentence-bounded chunk of the cleaned transcript; it extracts Key Points,
+# Action Items, and Notable Terms but does NOT include the session header
+# or a Summary paragraph (those are added by META_SUMMARY_PROMPT at the end).
+CHUNK_SUMMARY_PROMPT = """\
+You are summarizing part {part_index} of {part_count} from a longer meeting
+transcript. This chunk is a continuous slice of the conversation. Extract:
+
+- **Key Points**: 3-7 bullets covering the main ideas, decisions, or topics in
+  this chunk.
+- **Action Items**: specific tasks, follow-ups, or commitments mentioned in
+  this chunk (write "None" if absent).
+- **Notable Terms**: jargon, proper nouns, acronyms, project names, or
+  technical concepts used in this chunk (Term: Meaning format, one per line).
+  Skip common words. If none, write "None".
+
+Do not include a session header, date, source file, duration, or language.
+Do not include a "Summary" paragraph. Output only the three sections above
+as markdown.
+
+Chunk transcript:
+{text}
+"""
+
+# Meta-summary combines chunk partials into the canonical SUMMARY_PROMPT shape
+# (Session, Summary, Key Points, Terms, Action Items). The full cleaned text
+# is included as a "reference" pass when it fits; otherwise dropped (the
+# partials already contain the salient information).
+META_SUMMARY_PROMPT = r"""You have {part_count} partial summaries of a long
+meeting transcript, extracted sequentially. Combine them into a single
+markdown summary using the structure below. Preserve specific names, terms,
+decisions, and action items from the partials — do not generalize them away.
+
+## Session
+- **Date**: {session_date}
+- **Source file**: {source_file}
+- **Duration**: {duration}
+- **Language**: {language}
+(If any value is unknown, write "unknown" rather than guessing.)
+
+## Summary
+2-4 sentences capturing the main point of the meeting.
+
+## Key Points
+- 3-7 bullets covering the main ideas, decisions, or topics
+
+## Terms
+Present as a markdown table with two columns: `Term` and `Meaning`. Include jargon, proper nouns, acronyms, project names, product names, or technical concepts the speaker used. Skip common everyday words. If the partials use no notable terms, write `None` on its own line (no table at all).
+
+- Aim for 3-10 rows.
+- Use the exact format below, including the header separator row (three or more dashes per column). Do not wrap the table in a code fence.
+- Keep the `Meaning` column concise: one short sentence, no line breaks inside a cell. If pipes (`|`) appear inside a term or meaning, escape them as `\|`.
+- Example of the right shape:
+  | Term   | Meaning                                              |
+  | ------ | ---------------------------------------------------- |
+  | Falcon | Internal codename for the new dashboard project      |
+  | MRR    | Monthly recurring revenue                            |
+
+## Action Items
+- Specific tasks, follow-ups, or commitments mentioned (write "None" if absent)
+
+Be faithful to the partials. Do not invent details. If something is ambiguous, say so briefly.
+
+Partial summaries:
+{partials}
+
+Meeting transcript (for reference; prefer the partials if they conflict):
+{full_text}
+"""
+
 # Context windows: default 2048 silently truncates long memos.
 CLEANUP_CTX = 16384
 SUMMARY_CTX = 16384
 MAX_CTX = 32768    # hard cap: beyond this, splitting the input is the only option
+
+# Phase 3 (summary) chunking thresholds. When the cleaned transcript exceeds
+# CHUNK_TRIGGER_TOKENS, the script splits it on sentence boundaries into
+# chunks of ~CHUNK_TARGET_TOKENS tokens, summarizes each chunk separately,
+# and runs a final meta-summary to combine the partials. CHUNK_HARD_CAP_TOKENS
+# is a safety bound: any single sentence larger than this is treated as a
+# hard error (the splitter cannot split a single sentence). SUMMARY_PROMPT_OVERHEAD
+# is the approximate token cost of the SUMMARY_PROMPT template + expected
+# output markdown; subtracted when computing what fits in the meta-summary's
+# num_ctx window.
+CHUNK_TRIGGER_TOKENS = 25000    # above this, use the chunked path
+CHUNK_TARGET_TOKENS = 14000    # target size per chunk
+CHUNK_HARD_CAP_TOKENS = 20000  # per-chunk absolute max (safety net)
+SUMMARY_PROMPT_OVERHEAD = 1500  # prompt template + expected output slack
 
 
 # ─── phase 1: speech-to-text ────────────────────────────────────────────────
@@ -394,6 +478,168 @@ def _auto_num_ctx(input_tokens: int, default_ctx: int) -> int:
     return p
 
 
+# ─── phase 3 chunked path ────────────────────────────────────────────────────
+# Sentence boundary detection: period/!/? followed by whitespace and a
+# capital letter, opening quote, or apostrophe (catches "He said: 'Hello.'"),
+# plus blank lines (paragraph breaks). The lookbehind requires a real sentence
+# terminator so we don't split on abbreviations like "U.S.A." — though that
+# rule is imperfect, it's good enough for cleaned transcripts.
+_SENTENCE_BREAK_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z"\'])|\n\s*\n')
+
+def _split_into_sentences(text: str) -> list[str]:
+    """Split text into sentences on . ! ? followed by space+capital, and on
+    blank lines. Returns a list of stripped, non-empty sentence strings."""
+    if not text:
+        return []
+    parts = _SENTENCE_BREAK_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _split_into_chunks(text: str, ollama_url: str, model: str,
+                       target_tokens: int, hard_cap: int) -> list[str]:
+    """Split text into chunks of ~target_tokens, bounded by hard_cap.
+
+    Algorithm:
+      1. Split into sentences.
+      2. Tokenize each sentence via Ollama's /api/tokenize (or heuristic
+         fallback if the endpoint is unavailable).
+      3. Greedy accumulate: start a new chunk when adding the next sentence
+         would exceed target_tokens. If a single sentence exceeds hard_cap,
+         emit it alone (the caller detects this and errors out).
+      4. Return the chunks as joined-sentence strings.
+
+    Token counts may be approximate when /api/tokenize is unavailable, but
+    the algorithm still works — it just produces slightly uneven chunk sizes.
+    """
+    sentences = _split_into_sentences(text)
+    if not sentences:
+        return []
+
+    sent_tokens = [count_tokens(s, ollama_url, model) for s in sentences]
+    if sum(sent_tokens) == 0:
+        return []
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for s, t in zip(sentences, sent_tokens):
+        if t > hard_cap:
+            # Oversized sentence: emit any current chunk, then this sentence
+            # in its own chunk. Caller will detect it and error out.
+            if current:
+                chunks.append(current)
+            chunks.append([s])
+            current = []
+            current_tokens = 0
+            continue
+        if current_tokens + t > target_tokens and current:
+            chunks.append(current)
+            current = [s]
+            current_tokens = t
+        else:
+            current.append(s)
+            current_tokens += t
+    if current:
+        chunks.append(current)
+
+    return [" ".join(c) for c in chunks]
+
+
+def summarize_chunked_with_llm(cleaned_text: str, model: str, client: Client,
+                               ollama_url: str,
+                               session_meta: dict | None = None,
+                               debug: bool = False) -> str:
+    """Map-reduce summarization for cleaned transcripts too long for a
+    single 32k-context call.
+
+    Phase A (map): split cleaned_text on sentence boundaries into chunks of
+    ~CHUNK_TARGET_TOKENS tokens; summarize each with CHUNK_SUMMARY_PROMPT.
+    Phase B (reduce): concatenate partials and run META_SUMMARY_PROMPT on
+    the concatenation, with the full cleaned text included as a reference
+    pass when it fits in the context window.
+
+    The final output is still SUMMARY_PROMPT-shaped markdown: Session,
+    Summary, Key Points, Terms, Action Items.
+    """
+    n_total = count_tokens(cleaned_text, ollama_url, model)
+    tok_src = token_count_source(ollama_url, model)
+    print(f"        input: {n_total} tokens ({tok_src}); chunking at "
+          f"{CHUNK_TRIGGER_TOKENS} threshold, target {CHUNK_TARGET_TOKENS}/chunk")
+
+    chunks = _split_into_chunks(cleaned_text, ollama_url, model,
+                                CHUNK_TARGET_TOKENS, CHUNK_HARD_CAP_TOKENS)
+
+    # Optimization: if splitting produced a single chunk, just summarize
+    # directly. Avoids a pointless re-summarization round trip.
+    if len(chunks) == 1:
+        return summarize_with_llm(chunks[0], model, client,
+                                  session_meta=session_meta,
+                                  input_tokens=n_total, debug=debug)
+
+    # Sanity: verify each chunk is within the hard cap.
+    for i, c in enumerate(chunks, 1):
+        n = count_tokens(c, ollama_url, model)
+        if n > CHUNK_HARD_CAP_TOKENS:
+            sys.exit(
+                f"Chunk {i}/{len(chunks)} is {n} tokens, exceeding the "
+                f"{CHUNK_HARD_CAP_TOKENS} hard cap. The transcript likely "
+                f"contains a single very long sentence or paragraph that "
+                f"cannot be split safely. Re-run with a smaller Whisper "
+                f"model or split the audio."
+            )
+        print(format_budget(
+            f"phase 3 chunk {i}/{len(chunks)} input", n,
+            _auto_num_ctx(n, SUMMARY_CTX), tok_src))
+
+    # ── Phase A: map ─────────────────────────────────────────────────────
+    partials: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        prompt = CHUNK_SUMMARY_PROMPT.format(
+            part_index=i, part_count=len(chunks), text=chunk)
+        n_in = count_tokens(chunk, ollama_url, model)
+        print(f"[3/3] Summarizing chunk {i}/{len(chunks)} with '{model}'...")
+        partial = _stream_with_rate(client, model, prompt,
+                                    _auto_num_ctx(n_in, SUMMARY_CTX),
+                                    0.3,
+                                    desc=f"    chunk {i}/{len(chunks)}",
+                                    debug=debug)
+        partials.append(f"## Chunk {i}/{len(chunks)}\n\n{partial.strip()}\n")
+
+    partials_text = "\n".join(partials)
+
+    # ── Phase B: reduce ──────────────────────────────────────────────────
+    # Decide whether to include the full cleaned text as a reference pass.
+    # If partials + full_text + prompt overhead exceed MAX_CTX, drop the
+    # full text (it's a redundancy, the partials are what matters).
+    partials_tokens = count_tokens(partials_text, ollama_url, model)
+    full_tokens = count_tokens(cleaned_text, ollama_url, model)
+    if partials_tokens + full_tokens + SUMMARY_PROMPT_OVERHEAD <= MAX_CTX:
+        meta_full_text = cleaned_text
+    else:
+        meta_full_text = "(omitted — partials above are sufficient)"
+
+    meta = session_meta or {}
+    meta_prompt = META_SUMMARY_PROMPT.format(
+        part_count=len(chunks),
+        partials=partials_text,
+        full_text=meta_full_text,
+        session_date=meta.get("date", "unknown"),
+        source_file=meta.get("source_file", "unknown"),
+        duration=_format_duration(meta.get("duration")),
+        language=meta.get("language", "unknown"),
+    )
+
+    n_final_in = count_tokens(meta_prompt, ollama_url, model)
+    print(format_budget(
+        "phase 3 final (partials + meta)", n_final_in,
+        _auto_num_ctx(n_final_in, SUMMARY_CTX), tok_src))
+    print(f"[3/3] Writing final summary with '{model}'...")
+    return _stream_with_rate(client, model, meta_prompt,
+                             _auto_num_ctx(n_final_in, SUMMARY_CTX),
+                             0.3, desc="    meta     ", debug=debug)
+
+
 # ─── cli ────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -562,22 +808,27 @@ def main() -> None:
         # phase 3 only: still detect whether the tokenizer is exact or approximate
         tok_src = token_count_source(args.ollama_url, args.llm_model)
 
-    # phase 3 — chunked path is dispatched inside summarize_chunked_with_llm
-    # when the cleaned transcript is too large for a single 32k-context call.
+    # phase 3 — chunked path is dispatched when the cleaned transcript is
+    # too large for a single 32k-context call.
     n_clean_tok = count_tokens(cleaned, args.ollama_url, args.llm_model)
     ctx3 = _auto_num_ctx(n_clean_tok, SUMMARY_CTX)
     print(format_budget("phase 3 input (cleaned transcript)", n_clean_tok, ctx3, tok_src))
-    if n_clean_tok > MAX_CTX:
-        sys.exit(
-            f"\nCleaned transcript is {n_clean_tok} tokens, exceeding the "
-            f"{MAX_CTX} context cap. The chunker could not split this into "
-            f"sub-{MAX_CTX} pieces (likely a single very long sentence). "
-            f"Re-run with a smaller audio file."
-        )
-    summary = summarize_with_llm(cleaned, args.llm_model, client,
-                                 session_meta=session_meta,
-                                 input_tokens=n_clean_tok,
-                                 debug=args.debug)
+    if n_clean_tok > CHUNK_TRIGGER_TOKENS:
+        summary = summarize_chunked_with_llm(
+            cleaned, args.llm_model, client, args.ollama_url,
+            session_meta=session_meta, debug=args.debug)
+    else:
+        if n_clean_tok > MAX_CTX:
+            sys.exit(
+                f"\nCleaned transcript is {n_clean_tok} tokens, exceeding the "
+                f"{MAX_CTX} context cap. The chunker could not split this into "
+                f"sub-{MAX_CTX} pieces (likely a single very long sentence). "
+                f"Re-run with a smaller audio file."
+            )
+        summary = summarize_with_llm(cleaned, args.llm_model, client,
+                                     session_meta=session_meta,
+                                     input_tokens=n_clean_tok,
+                                     debug=args.debug)
     write(summary_path, summary)
 
     print(f"\nDone. Output files in: {out_dir}")
