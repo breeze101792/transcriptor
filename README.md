@@ -1,10 +1,19 @@
 # transcriptor
 
-Transcribe iPhone Voice Memos **fully locally** — nothing leaves your Mac.
+Transcribe iPhone Voice Memos (or any audio) **fully locally** — nothing leaves your machine. Works on macOS and Linux.
 
 Pipeline: **Whisper (STT) → local LLM (cleanup) → local LLM (summary)**
 
 ## One-time setup
+
+> All examples use `./start.sh`, the bundled wrapper. It installs `uv` if
+> missing, runs `uv sync`, and (on Linux only) wires up the bundled cu12
+> cuBLAS / cuDNN libraries that `faster-whisper`'s ctranslate2 wheel needs.
+> On macOS that section is skipped automatically — Apple Silicon uses Metal
+> via the Accelerate framework. macOS users who prefer the bare
+> `uv run transcribe.py …` invocation can still use it.
+
+### macOS
 
 ```bash
 # 1. system deps
@@ -14,36 +23,68 @@ brew install ffmpeg ollama
 ollama serve
 
 # 3. in another terminal, pull the LLM you want (downloads ~1.5 GB once)
-#    macOS:    ollama pull qwen3.5:2b-mlx
-#    Linux:    ollama pull qwen3.5:2b
+ollama pull qwen3.5:2b-mlx
 
-# 4. install python deps
-uv sync
+# 4. (only the first time) make start.sh executable
+chmod +x start.sh
 ```
+
+### Linux
+
+The `faster-whisper` / ctranslate2 wheel on PyPI is built against CUDA 12.
+`start.sh` handles the cu12 libs for you, but it can't install your system
+packages — those need to be in place before the first run.
+
+```bash
+# 1. system deps (Arch shown; adapt to your distro)
+sudo pacman -S ffmpeg nvidia-utils cuda                    # Arch
+#   or, on Ubuntu / Debian:
+# sudo apt install ffmpeg && curl -fsSL https://ollama.com/install.sh | sh
+
+# 2. start Ollama in a terminal and leave it running
+ollama serve
+
+# 3. in another terminal, pull the LLM you want (downloads ~1.5 GB once)
+ollama pull qwen3.5:2b                                    # Linux (no -mlx variant)
+
+# 4. (only the first time) make start.sh executable
+chmod +x start.sh
+```
+
+`start.sh` will:
+
+- install `uv` to `~/.local/bin` if it's not on `PATH`
+- run `uv sync` to create/update the venv
+- on Linux: install `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` into the
+  venv (no-op if already there) and export `LD_LIBRARY_PATH` so the
+  cu12-built `ctranslate2` can find them — the system has CUDA 13's
+  `libcublas.so.13`, but the wheel wants `libcublas.so.12`
+- on macOS: skip the cu12 section entirely
+- `exec uv run transcribe.py …` with all forwarded args
 
 ## Usage
 
 ```bash
 # basic
-uv run transcribe.py recording.m4a
+./start.sh recording.m4a
 
-# with options
-uv run transcribe.py recording.m4a \
+# with options (use qwen3.5:2b-mlx on macOS, qwen3.5:2b on Linux)
+./start.sh recording.m4a \
     --output-dir ./output \
     --whisper-model small \
-    --llm-model qwen3.5:2b-mlx
+    --llm-model qwen3.5:2b-mlx    # on macOS — use qwen3.5:2b on Linux
 
 # only produce the raw transcript (no LLM)
-uv run transcribe.py recording.m4a --skip-cleanup
+./start.sh recording.m4a --skip-cleanup
 
 # only transcribe + clean (no summary)
-uv run transcribe.py recording.m4a --skip-summary
+./start.sh recording.m4a --skip-summary
 
 # re-run cleanup + summary on an existing transcript (skips STT entirely)
-uv run transcribe.py --from-raw ./output/old_run/recording.raw.txt
+./start.sh --from-raw ./output/old_run/recording.raw.txt
 
 # re-run only the summary on an existing cleaned transcript (skips STT + cleanup)
-uv run transcribe.py --from-cleaned ./output/old_run/recording.cleaned.txt
+./start.sh --from-cleaned ./output/old_run/recording.cleaned.txt
 ```
 
 ## Outputs
@@ -145,4 +186,5 @@ The summary phase produces a markdown file with these sections:
 
 - **`Cannot reach Ollama`** — start it: `ollama serve`, or pass `--ollama-url` to point at a different host/port
 - **`Model 'X' not found`** — pull it: `ollama pull X`
+- **`RuntimeError: Library libcublas.so.12 is not found or cannot be loaded`** (Linux) — the system has CUDA 13 but the cu12 wheel of ctranslate2 needs cu12. Use `./start.sh` (it installs `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` and sets `LD_LIBRARY_PATH`), or set `LD_LIBRARY_PATH` manually to wherever `libcublas.so.12` lives.
 - **First Whisper run is slow** — the model (~460 MB for `small`) downloads once and is cached afterwards.
