@@ -1,5 +1,6 @@
 # local outputs (per-run transcript folders)
 output/
+data/
 
 # python
 __pycache__/
