@@ -157,7 +157,15 @@ Before each LLM phase, the script counts the tokens in the input text and prints
         phase 2 input (raw transcript): 22100 / 32768 tokens (67%, exact)
 ```
 
-Above 32768 input tokens the script exits with a clear error suggesting the audio be split into shorter chunks, since most local Ollama models can't run with a context window larger than 32k without OOM-ing.
+Above 32768 input tokens for **phase 2 (cleanup)** the script exits with a clear error, since most local Ollama models can't run with a context window larger than 32k without OOM-ing. **Phase 3 (summary)** auto-chunks above 25000 input tokens (see below), so a 32768-token cleaned transcript is fine.
+
+**Auto-chunking for the summary phase.** When the cleaned transcript exceeds **25000 tokens**, the script automatically switches to a map-reduce chunked-summary path:
+
+1. Split the cleaned text on sentence boundaries into chunks of ~14000 tokens each.
+2. Run a focused "extract Key Points, Action Items, Notable Terms" prompt on each chunk.
+3. Concatenate the partials and run a final meta-summary that produces the same canonical markdown structure (Session / Summary / Key Points / Terms / Action Items).
+
+The full cleaned text is included as a "reference" pass in the meta-summary when it fits in the 32k context window; otherwise it's dropped (the partials already contain the salient info). Cleanup (phase 2) is intentionally **not** chunked — it's a mechanical line-by-line pass, and chunking it risks cross-boundary sentence fragments. For very long raw transcripts, a warning is printed if the input is over ~8000 tokens, since cleanup is single-shot and quality may degrade at the upper end of the 32k window.
 
 ## Summary structure
 
@@ -187,4 +195,6 @@ The summary phase produces a markdown file with these sections:
 - **`Cannot reach Ollama`** — start it: `ollama serve`, or pass `--ollama-url` to point at a different host/port
 - **`Model 'X' not found`** — pull it: `ollama pull X`
 - **`RuntimeError: Library libcublas.so.12 is not found or cannot be loaded`** (Linux) — the system has CUDA 13 but the cu12 wheel of ctranslate2 needs cu12. Use `./start.sh` (it installs `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` and sets `LD_LIBRARY_PATH`), or set `LD_LIBRARY_PATH` manually to wherever `libcublas.so.12` lives.
+- **Long meeting (>~2 hours) and the summary keeps getting truncated or repeats itself** — cleanup is single-shot at 32k context; for very long raw transcripts the cleaned output may itself be truncated, which then feeds a degraded summary. The summary phase now auto-chunks above 25000 cleaned tokens, but the underlying cleanup output is still single-shot. Splitting the audio into shorter pieces is the only way to get a higher-quality cleanup on long meetings.
+- **`Chunk N/M is N tokens, exceeding the 20000 hard cap`** — the cleaned transcript contains a single sentence longer than the per-chunk safety bound. The splitter cannot split a single sentence. Re-run with a smaller Whisper model (which may produce shorter sentences) or split the audio manually.
 - **First Whisper run is slow** — the model (~460 MB for `small`) downloads once and is cached afterwards.
